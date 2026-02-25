@@ -1,122 +1,83 @@
 from django.http import StreamingHttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 import cv2
-import numpy as np
-import threading
-import time
 import json
+import time
+import threading
 
-# ================= CAMERA =================
+# ================= GLOBAL CAMERA =================
 
-class Camera:
-    def __init__(self):
-        self.cap = cv2.VideoCapture(0)
+camera = cv2.VideoCapture(0)
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+lock = threading.Lock()
+      
+# ================= SETTINGS PER CAMERA =================
 
-        self.frame = None
-        self.running = True
+settings = {
+    1: {"threshold": 128, "sepi": 100000, "sedang": 50000, "padat": 0},
+    2: {"threshold": 128, "sepi": 100000, "sedang": 50000, "padat": 0},
+    3: {"threshold": 128, "sepi": 100000, "sedang": 50000, "padat": 0},
+    4: {"threshold": 128, "sepi": 100000, "sedang": 50000, "padat": 0},
+}
 
-        threading.Thread(target=self.update, daemon=True).start()
-
-    def update(self):
-        while self.running:
-
-            if not self.cap.isOpened():
-                print("❌ Kamera gagal")
-                time.sleep(1)
-                self.cap = cv2.VideoCapture(0)
-                continue
-
-            success, frame = self.cap.read()
-
-            if success:
-                self.frame = frame
-
-            time.sleep(0.05)
-
-    def get_frame(self):
-        return self.frame
-
-
-camera = Camera()
-
-# ================= SETTINGS 4 CAMERA =================
-
-cam_settings = [
-    {"threshold": 120, "sepi": 100000, "sedang": 50000, "padat": 0},
-    {"threshold": 130, "sepi": 100000, "sedang": 50000, "padat": 0},
-    {"threshold": 140, "sepi": 100000, "sedang": 50000, "padat": 0},
-    {"threshold": 150, "sepi": 100000, "sedang": 50000, "padat": 0},
+camera_data = [
+    {"status": "Sepi", "area": 0},
+    {"status": "Sepi", "area": 0},
+    {"status": "Sepi", "area": 0},
+    {"status": "Sepi", "area": 0},
 ]
+
+FPS = 15
+FRAME_DELAY = 1 / FPS
+
 
 # ================= PROCESS =================
 
-def process_frame(frame, setting):
+def process_frame(frame, cam_id):
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    _, binary = cv2.threshold(
-        gray,
-        setting["threshold"],
-        255,
-        cv2.THRESH_BINARY
-    )
+    th = settings[cam_id]["threshold"]
 
-    area = int(cv2.countNonZero(binary))
+    _, thresh = cv2.threshold(gray, th, 255, cv2.THRESH_BINARY)
 
-    if area > setting["sepi"]:
-        status = "Padat"
-    elif area > setting["sedang"]:
+    area = cv2.countNonZero(thresh)
+
+    sepi = settings[cam_id]["sepi"]
+    sedang = settings[cam_id]["sedang"]
+
+    if area > sepi:
+        status = "Sepi"
+    elif area > sedang:
         status = "Sedang"
     else:
-        status = "Sepi"
+        status = "Padat"
 
-    binary = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    camera_data[cam_id - 1] = {
+        "status": status,
+        "area": int(area)
+    }
 
-    return binary, area, status
+    return thresh
 
 
-# ================= VIDEO STREAM =================
+# ================= STREAM GENERATOR =================
 
-def gen_frames():
+def gen_frames(cam_id):
 
     while True:
 
-        frame = camera.get_frame()
+        start_time = time.time()
 
-        if frame is None:
+        with lock:
+            success, frame = camera.read()
+
+        if not success:
             continue
 
-        frame = cv2.resize(frame, (320, 240))
+        frame = process_frame(frame, cam_id)
 
-        cams = []
-
-        for i in range(4):
-
-            img, area, status = process_frame(frame, cam_settings[i])
-
-            cv2.putText(
-                img,
-                f"CAM {i+1} | {status} | {area}",
-                (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1
-            )
-
-            cams.append(img)
-
-        top = np.hstack((cams[0], cams[1]))
-        bottom = np.hstack((cams[2], cams[3]))
-        combined = np.vstack((top, bottom))
-
-        ret, buffer = cv2.imencode('.jpg', combined)
-
-        if not ret:
-            continue
+        _, buffer = cv2.imencode('.jpg', frame)
 
         yield (
             b'--frame\r\n'
@@ -125,37 +86,30 @@ def gen_frames():
             b'\r\n'
         )
 
+        elapsed = time.time() - start_time
+        sleep_time = FRAME_DELAY - elapsed
 
-def video_feed(request):
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+
+# ================= VIDEO API =================
+
+def video_feed(request, cam_id):
+
     return StreamingHttpResponse(
-        gen_frames(),
+        gen_frames(cam_id),
         content_type='multipart/x-mixed-replace; boundary=frame'
     )
 
 
-# ================= DATA FEED =================
+# ================= DATA API =================
 
-def data_feed(request):
+def get_data(request):
 
-    frame = camera.get_frame()
-
-    if frame is None:
-        return JsonResponse({"error": "no frame"})
-
-    results = []
-
-    for i in range(4):
-
-        _, area, status = process_frame(frame, cam_settings[i])
-
-        results.append({
-            "cam": i + 1,
-            "status": status,
-            "area": area,
-            "threshold": cam_settings[i]["threshold"],
-        })
-
-    return JsonResponse({"cameras": results})
+    return JsonResponse({
+        "cameras": camera_data
+    })
 
 
 # ================= UPDATE THRESHOLD =================
@@ -163,35 +117,27 @@ def data_feed(request):
 @csrf_exempt
 def set_threshold(request):
 
-    if request.method == "POST":
+    body = json.loads(request.body)
 
-        data = json.loads(request.body.decode("utf-8"))
+    cam = body["camera"]
+    value = body["threshold"]
 
-        cam = int(data.get("cam", 1)) - 1
-        threshold = int(data.get("threshold", 120))
+    settings[cam]["threshold"] = value
 
-        cam_settings[cam]["threshold"] = threshold
-
-        return JsonResponse({"message": "ok"})
-
-    return JsonResponse({"error": "invalid"}, status=405)
+    return JsonResponse({"ok": True})
 
 
-# ================= UPDATE CLASS =================
+# ================= UPDATE CLASSIFICATION =================
 
 @csrf_exempt
 def set_classification(request):
 
-    if request.method == "POST":
+    body = json.loads(request.body)
 
-        data = json.loads(request.body.decode("utf-8"))
+    cam = body["camera"]
 
-        cam = int(data.get("cam", 1)) - 1
+    settings[cam]["sepi"] = body["sepi"]
+    settings[cam]["sedang"] = body["sedang"]
+    settings[cam]["padat"] = body["padat"]
 
-        cam_settings[cam]["sepi"] = int(data.get("sepi"))
-        cam_settings[cam]["sedang"] = int(data.get("sedang"))
-        cam_settings[cam]["padat"] = int(data.get("padat"))
-
-        return JsonResponse({"message": "ok"})
-
-    return JsonResponse({"error": "invalid"}, status=405)
+    return JsonResponse({"ok": True})

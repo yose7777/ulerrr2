@@ -3,5 +3,5 @@ from django.urls import path, include
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', include('stream.urls')),  # pastikan ini ada
+    path('', include('stream.urls')),
 ]
